@@ -719,8 +719,12 @@ def test_v41_compressor_metadata_maps_tokens_to_their_ring():
 @pytest.mark.parametrize(
     "use_aux,use_graph", [(False, False), (True, False), (True, True)]
 )
+@pytest.mark.parametrize("compress_ratio,use_fp4", [(2, False), (1, True)])
+@pytest.mark.parametrize("split_global_kv", [False, True])
 @torch.inference_mode()
-def test_v41_attention_joins_cache_writes_before_consumption(use_aux, use_graph):
+def test_v41_attention_joins_cache_writes_before_consumption(
+    use_aux, use_graph, compress_ratio, use_fp4, split_global_kv
+):
     """Both reused-event joins must publish this forward's states and cache rows."""
     from vllm.forward_context import ForwardContext, override_forward_context
     from vllm.models.deepseek_v41.attention import (
@@ -730,16 +734,20 @@ def test_v41_attention_joins_cache_writes_before_consumption(use_aux, use_graph)
     from vllm.models.deepseek_v41.compressor import DeepseekCompressor
 
     torch.manual_seed(43)
-    raw = torch.randn(19, 1024, device="cuda")
+    raw = torch.randn(19, 512 * compress_ratio, device="cuda")
     q = torch.zeros(19, 512, dtype=torch.bfloat16, device="cuda")
     positions = torch.arange(7, 26, device="cuda")
     state_slots = positions.clone()
     state_slots[-2:] = -1
-    cache_slots = torch.where(state_slots >= 0, positions // 2, -1)
+    cache_slots = torch.where(state_slots >= 0, positions // compress_ratio, -1)
     state = torch.empty(4, 8, 1024, device="cuda")
-    main = torch.empty(1, 128, 584, dtype=torch.uint8, device="cuda")
-    index = torch.empty(1, 128, 132, dtype=torch.uint8, device="cuda")
-    caches = (state, main, index)
+    main = torch.empty(
+        1, 128, 288 if use_fp4 else 584, dtype=torch.uint8, device="cuda"
+    )
+    index = torch.empty(
+        1, 128, 68 if use_fp4 else 132, dtype=torch.uint8, device="cuda"
+    )
+    caches = (state, main, index) if compress_ratio > 1 else (main, index)
     observed = tuple(torch.empty_like(cache) for cache in caches)
     rotary = SimpleNamespace(cos_sin_cache=torch.randn(32, 64, device="cuda"))
     metadata = {
@@ -757,13 +765,15 @@ def test_v41_attention_joins_cache_writes_before_consumption(use_aux, use_graph)
     compressor.head_dim, compressor.rope_head_dim, compressor.compress_ratio = (
         512,
         64,
-        2,
+        compress_ratio,
     )
     compressor.rms_norm_eps = 1e-20
     compressor.norm = SimpleNamespace(
         weight=torch.ones(512, dtype=torch.bfloat16, device="cuda")
     )
-    compressor.state_cache = SimpleNamespace(prefix="state", kv_cache=state)
+    compressor.state_cache = (
+        SimpleNamespace(prefix="state", kv_cache=state) if compress_ratio > 1 else None
+    )
     compressor.k_cache_prefix = "main"
     compressor._static_forward_context = {"main": SimpleNamespace(kv_cache=main)}
     indexer_weight = torch.randn(128, 512, dtype=torch.bfloat16, device="cuda")
@@ -775,13 +785,19 @@ def test_v41_attention_joins_cache_writes_before_consumption(use_aux, use_graph)
             variance_epsilon=1e-20,
         ),
         k_cache=SimpleNamespace(prefix="index", kv_cache=index),
-        compress_ratio=2,
-        use_fp4_kv=False,
+        compress_ratio=compress_ratio,
+        use_fp4_kv=use_fp4,
     )
 
-    def prepare_indexer(qr, latent, weights, positions, rotary, qr_scale):
-        DeepseekV4Indexer._produce_k(indexer, latent, positions, rotary)
-        return None, None, None
+    class Indexer:
+        owns_k = True
+
+        def _produce_k(self, latent, positions, rotary):
+            DeepseekV4Indexer._produce_k(indexer, latent, positions, rotary)
+
+        def __call__(self, qr, latent, weights, positions, rotary, qr_scale):
+            self._produce_k(latent, positions, rotary)
+            return None, None, None
 
     def observe(*args):
         for output, cache in zip(observed, caches):
@@ -790,7 +806,7 @@ def test_v41_attention_joins_cache_writes_before_consumption(use_aux, use_graph)
     auxiliary = [torch.cuda.Stream()] if use_aux else None
     attention = SimpleNamespace(
         compressor=compressor,
-        indexer=prepare_indexer,
+        indexer=Indexer(),
         aux_stream_list=auxiliary,
         ln_events=[torch.cuda.Event(), torch.cuda.Event()],
         rotary_emb=rotary,
@@ -800,12 +816,15 @@ def test_v41_attention_joins_cache_writes_before_consumption(use_aux, use_graph)
         _wq_b_proj=lambda qr, scale: qr.clone(),
         _fused_qnorm_rope_kv_insert=lambda q, kv, pos, meta: q,
         _sparse_indexer_and_attn=observe,
+        _project_compressor=lambda hidden: raw,
     )
 
-    def run():
+    def run(split=split_global_kv):
         with override_forward_context(context):
+            if split:
+                DeepseekV4Attention.build_global_kv(attention, positions, q)
             DeepseekV4Attention._prepare_and_attn(
-                attention, q, q, q, None, raw, q, positions, q
+                attention, q, q, q, None, None if split else raw, q, positions, q
             )
 
     def reset():
@@ -831,7 +850,7 @@ def test_v41_attention_joins_cache_writes_before_consumption(use_aux, use_graph)
         raw.normal_()
         reset()
         attention.aux_stream_list = None
-        run()
+        run(split=False)
         expected = tuple(output.clone() for output in observed)
         reset()
         attention.aux_stream_list = auxiliary

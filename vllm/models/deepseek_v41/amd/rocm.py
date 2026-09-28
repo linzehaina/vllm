@@ -566,11 +566,6 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             )
         return super()._fused_wqa_wkv_gemm(hidden_states)
 
-    def _run_parallel_input_projections(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        return super()._run_parallel_input_projections(hidden_states)
-
     @functools.cached_property
     def _wq_b_uses_aiter_block_scaled(self) -> bool:
         """True when both wq_b GEMMs run the aiter block-scaled fp8 kernel.

@@ -618,6 +618,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
+        *,
+        kv_cache_prebuilt: bool = False,
     ) -> torch.Tensor:
         # The eager attention region writes into a caller-owned buffer
         # (breakable_cudagraph needs in-place outputs); its shape and how it is
@@ -627,7 +629,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # Keep the attention input preparation in the captured graph. Only the
         # sparse indexer and MLA attention run in the eager break below.
         qr_kv, kv_score, indexer_weights = self._run_parallel_input_projections(
-            hidden_states
+            hidden_states, kv_cache_prebuilt=kv_cache_prebuilt
         )
         qr, qr_scale, kv = self._split_qkv_and_norm(qr_kv)
 
@@ -642,6 +644,21 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             attn_out,
         )
         return self._o_proj(attn_out, positions)
+
+    def build_global_kv(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> None:
+        """Publish global KV and index K without computing queries or SWA KV."""
+        compressor, indexer = self.compressor, self.indexer
+        assert compressor is not None and indexer is not None and indexer.owns_k
+        latent = compressor(self._project_compressor(hidden_states), positions)
+        maybe_execute_in_parallel(
+            lambda: indexer._produce_k(latent, positions, self.indexer_rotary_emb),
+            lambda: compressor.insert_cache(latent, positions, self.rotary_emb),
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream_list[0] if self.aux_stream_list is not None else None,
+        )
 
     def _alloc_attn_out(
         self, num_tokens: int, hidden_states: torch.Tensor
@@ -702,8 +719,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         qr: torch.Tensor | QuantizedActivation,
         kv: torch.Tensor,
         qr_scale: torch.Tensor | None,
-        kv_score: torch.Tensor,
-        indexer_weights: torch.Tensor,
+        kv_score: torch.Tensor | None,
+        indexer_weights: torch.Tensor | None,
         positions: torch.Tensor,
         attn_out: "torch.Tensor | QuantizedActivation",
     ) -> None:
@@ -729,8 +746,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         qr: torch.Tensor | QuantizedActivation,
         kv: torch.Tensor,
         qr_scale: torch.Tensor | None,
-        kv_score: torch.Tensor,
-        indexer_weights: torch.Tensor,
+        kv_score: torch.Tensor | None,
+        indexer_weights: torch.Tensor | None,
         positions: torch.Tensor,
         attn_out: "torch.Tensor | QuantizedActivation",
     ) -> None:
@@ -744,7 +761,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         """
         attn_metadata = get_forward_context().attn_metadata
         indexer = self.indexer
-        compressor = self.compressor
+        compressor = self.compressor if kv_score is not None else None
         aux_streams = self.aux_stream_list
 
         def project_query_and_cache_kv() -> torch.Tensor:
@@ -824,7 +841,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         return self.wq_b(qr)
 
     def _run_parallel_input_projections(
-        self, hidden_states: torch.Tensor
+        self, hidden_states: torch.Tensor, *, kv_cache_prebuilt: bool = False
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -841,18 +858,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # unlike v4.0 there is no indexer K GEMM over hidden_states here.
         aux_fns: list[Callable[[], Any] | None] = [None, None]
 
-        if self.compressor is not None:
-            # Local ref so the closure keeps a non-None type for mypy.
-            compressor = self.compressor
-
-            def compressor_kv_score() -> torch.Tensor:
-                return torch.mm(
-                    hidden_states,
-                    compressor.fused_wkv_wgate.weight.T,
-                    out_dtype=torch.float32,
-                )
-
-            aux_fns[0] = compressor_kv_score
+        if self.compressor is not None and not kv_cache_prebuilt:
+            aux_fns[0] = lambda: self._project_compressor(hidden_states)
 
         if self.indexer is not None:
             indexer = self.indexer
@@ -875,6 +882,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         )
 
         return qr_kv, kv_score, indexer_weights
+
+    def _project_compressor(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        assert self.compressor is not None
+        return torch.mm(
+            hidden_states,
+            self.compressor.fused_wkv_wgate.weight.T,
+            out_dtype=torch.float32,
+        )
 
     @eager_break_during_capture
     def _sparse_indexer_and_attn(
