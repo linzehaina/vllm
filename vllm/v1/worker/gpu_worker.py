@@ -930,6 +930,9 @@ class Worker(WorkerBase):
 
         # All warmup is done — start monitoring for unexpected JIT
         # compilations that would cause latency spikes during inference.
+        if self.use_v2_model_runner:
+            self.model_runner.model_state.is_warming_up = False
+
         from vllm.utils.jit_monitor import activate as activate_jit_monitor
 
         activate_jit_monitor(

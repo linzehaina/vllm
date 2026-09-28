@@ -214,6 +214,7 @@ class DeepseekSparseSWAMetadata:
     prefill_window_size: int = 0
     prefill_max_model_len: int = 0
     prefill_max_num_batched_tokens: int = 0
+    prefill_swa_bounded_replay: bool = False
 
     # Per-layer-type FlashMLA tile-scheduler metadata. One FlashMLASchedMeta
     # per present DeepseekV4 layer type, shared across all ~60 layers of that type
@@ -267,6 +268,8 @@ class DeepseekSparseSWAMetadata:
         gather_lens_cpu = self.prefill_query_lens_cpu + torch.clamp(
             prefix_lens_cpu, min=0, max=self.prefill_window_size - 1
         )
+        if self.prefill_swa_bounded_replay:
+            gather_lens_cpu = self.prefill_query_lens_cpu
         compressed_lens_cpu = (
             torch.div(
                 self.prefill_seq_lens_cpu,

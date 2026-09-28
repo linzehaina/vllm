@@ -58,6 +58,7 @@ class ModelState(ABC):
         self.scheduler_config = vllm_config.scheduler_config
         self.model = model
         self.device = device
+        self.is_warming_up = True
 
         self.max_model_len = self.model_config.max_model_len
         self.max_num_reqs = self.scheduler_config.max_num_seqs

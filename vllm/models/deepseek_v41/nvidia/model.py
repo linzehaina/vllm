@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import typing
 from collections.abc import Callable, Iterable
+from contextlib import ExitStack
 from itertools import islice
 
 import regex as re
@@ -64,6 +65,10 @@ from vllm.models.deepseek_v4.nvidia.model import (
     make_deepseek_v4_expert_params_mapping,
 )
 from vllm.models.deepseek_v41.attention import DeepseekV4Attention
+from vllm.models.deepseek_v41.ced_prefill import (
+    CED_FIRST_REPLAY_LAYER,
+    CEDPrefillPlan,
+)
 from vllm.models.deepseek_v41.nvidia.flash_mla_mega_attn import (
     DeepseekV4MegaAttnAttention,
 )
@@ -339,6 +344,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         engram_mask: torch.Tensor | None = None,
         *,
         capture_previous_aux: bool = False,
+        ced_prefill_plan: CEDPrefillPlan | None = None,
+        ced_context: ExitStack | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -441,7 +448,22 @@ class DeepseekV4DecoderLayer(nn.Module):
         if self.use_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
 
-        x = self.attn(positions, x, None)
+        if ced_prefill_plan is not None:
+            assert not self.use_sequence_parallel and ced_context is not None
+            self.attn.build_global_kv(positions, x)
+            if not ced_prefill_plan.layout.final_chunk:
+                return x, residual, post_mix, res_mix, attn_pre, previous_aux
+            token_slice = ced_prefill_plan.layout.token_slice
+            x, residual, post_mix, res_mix, attn_pre = (
+                state[token_slice]
+                for state in (x, residual, post_mix, res_mix, attn_pre)
+            )
+            positions = positions[token_slice]
+            input_ids = input_ids[token_slice] if input_ids is not None else None
+            ced_context.enter_context(ced_prefill_plan.tail_context())
+            x = self.attn(positions, x, None, kv_cache_prebuilt=True)
+        else:
+            x = self.attn(positions, x, None)
         if self.use_sequence_parallel:
             x = sp_reduce_scatter(x)
 
@@ -621,6 +643,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
+        ced_prefill_plan: CEDPrefillPlan | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -713,27 +736,50 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # Every layer's post runs inside the next layer's fused pre, so aux
         # hidden states are read back from there instead of recomputed.
         aux_hidden_by_layer: dict[int, torch.Tensor] = {}
-        for idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer),
-            start=self.start_layer,
-        ):
-            hidden_states, residual, post_mix, res_mix, pre_mix, previous_aux = layer(
-                hidden_states,
-                positions,
-                input_ids,
-                pre_mix,
-                post_mix,
-                res_mix,
-                residual,
-                engram_hashes,
-                engram_mask,
-                capture_previous_aux=idx in self.aux_hidden_state_layers,
-            )
-            if previous_aux is not None:
-                # idx is the one-based id of the layer whose post this is.
-                if self.use_sequence_parallel:
-                    previous_aux = sp_all_gather(previous_aux)[:full_num_tokens]
-                aux_hidden_by_layer[idx] = previous_aux
+        with ExitStack() as context_stack:
+            for idx, layer in enumerate(
+                islice(self.layers, self.start_layer, self.end_layer),
+                start=self.start_layer,
+            ):
+                ced_kwargs = {}
+                if ced_prefill_plan is not None and idx == CED_FIRST_REPLAY_LAYER:
+                    ced_kwargs = {
+                        "ced_prefill_plan": ced_prefill_plan,
+                        "ced_context": context_stack,
+                    }
+                (
+                    hidden_states,
+                    residual,
+                    post_mix,
+                    res_mix,
+                    pre_mix,
+                    previous_aux,
+                ) = layer(
+                    hidden_states,
+                    positions,
+                    input_ids,
+                    pre_mix,
+                    post_mix,
+                    res_mix,
+                    residual,
+                    engram_hashes,
+                    engram_mask,
+                    capture_previous_aux=idx in self.aux_hidden_state_layers,
+                    **ced_kwargs,
+                )
+                if ced_kwargs:
+                    if not ced_prefill_plan.layout.final_chunk:
+                        return hidden_states.new_zeros(
+                            (full_num_tokens, self.config.hidden_size)
+                        )
+                    token_slice = ced_prefill_plan.layout.token_slice
+                    positions = positions[token_slice]
+                    input_ids = input_ids[token_slice]
+                    engram_hashes, engram_mask = None, None
+                if previous_aux is not None:
+                    if self.use_sequence_parallel:
+                        previous_aux = sp_all_gather(previous_aux)[:full_num_tokens]
+                    aux_hidden_by_layer[idx] = previous_aux
         if layer is not None:
             # The last layer has no successor to fold its post into.
             hidden_states = mhc_post_tilelang(
@@ -771,6 +817,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         assert pre_mix is not None
         hidden_states = hc_collapse_triton(hidden_states, pre_mix)
         hidden_states = self.norm(hidden_states)
+        if ced_prefill_plan is not None:
+            full_output = hidden_states.new_zeros(
+                (full_num_tokens, self.config.hidden_size)
+            )
+            full_output[ced_prefill_plan.layout.token_slice] = hidden_states
+            hidden_states = full_output
         if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
             # Without MTP, gather only the collapsed and normalized hidden states.
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
@@ -1190,6 +1242,7 @@ class DeepseekV41LLMForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
+        ced_prefill_plan: CEDPrefillPlan | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
             input_ids,
@@ -1197,6 +1250,7 @@ class DeepseekV41LLMForCausalLM(
             intermediate_tensors,
             inputs_embeds,
             lookback_token_ids=lookback_token_ids,
+            ced_prefill_plan=ced_prefill_plan,
         )
         return hidden_states
 
