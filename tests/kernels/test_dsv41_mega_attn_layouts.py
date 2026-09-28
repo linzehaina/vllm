@@ -7,6 +7,7 @@ The kernel's Q and O layouts are produced by permuting ``wq_b`` rows and
 agree with a reference that permutes the activation instead.
 """
 
+import pytest
 import torch
 
 from vllm.models.deepseek_v41.common.ops.fused_layout import (
@@ -20,6 +21,44 @@ from vllm.models.deepseek_v41.common.ops.fused_layout import (
 )
 
 HEAD_DIM = 512
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("bounded_replay", [False, True])
+def test_swa_indices_stay_inside_gathered_region(bounded_replay):
+    from vllm.models.deepseek_v4.common.ops.cache_utils import (
+        combine_topk_swa_indices,
+    )
+
+    device = "cuda"
+    query_length, sequence_length, window = 128, 32768, 128
+    gather_length = 128 if bounded_replay else 255
+    topk = torch.tensor([0, 1], device=device, dtype=torch.int32).repeat(128, 1)
+    indices, lengths = combine_topk_swa_indices(
+        topk,
+        torch.tensor([0, query_length], device=device, dtype=torch.int32),
+        torch.tensor([sequence_length], device=device, dtype=torch.int32),
+        torch.tensor([gather_length], device=device, dtype=torch.int32),
+        window,
+        1,
+        2,
+        sequence_length + gather_length,
+        sequence_length,
+    )
+    indices, lengths = indices.cpu(), lengths.cpu()
+    gather_start = sequence_length - gather_length
+    for query_index in range(query_length):
+        position = sequence_length - query_length + query_index
+        swa_start = max(position - window + 1, gather_start)
+        expected = [0, 1] + list(
+            range(
+                sequence_length + swa_start - gather_start,
+                sequence_length + position - gather_start + 1,
+            )
+        )
+        assert lengths[query_index].item() == len(expected)
+        assert indices[query_index, : len(expected)].tolist() == expected
+        assert (indices[query_index, len(expected) :] == -1).all()
 
 
 def test_permuted_wq_b_gemm_matches_permuted_activation():

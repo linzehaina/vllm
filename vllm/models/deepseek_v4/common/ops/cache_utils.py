@@ -893,7 +893,7 @@ class CombineTopkSwaIndicesKernel(
                 left = 0
                 right = 0
             left_add = tl.maximum(left - (WINDOW_SIZE - 1), 0)
-            swa_start = tl.maximum(pos - (WINDOW_SIZE - 1) - left_add, 0)
+            swa_start = tl.maximum(pos - (WINDOW_SIZE - 1) - left_add, gather_start)
             swa_len = pos + right - swa_start + 1
 
             offset = tl.arange(0, PADDED_TOP_K)
